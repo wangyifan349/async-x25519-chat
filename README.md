@@ -13,14 +13,6 @@
 
 ## 适用场景与安全提醒
 - 适合学习、演示和受信任网络中的点对点加密通信。  
-- 本项目示例未包含身份认证（签名或证书），因此不能防范中间人攻击（MITM）。生产环境请添加节点认证或签名机制、密钥轮换、重放防护和更严格的错误处理。
-
-## 目录（示例）
-仓库中建议包含以下文件：
-- async_tcp_x25519_readable.py — 主程序（client/server 双模式，asyncio 实现）。  
-- README.md — 本文件。  
-- LICENSE — MIT 许可证文件。  
-- requirements.txt — 依赖列表（示例：cryptography）。  
 
 ## 依赖
 - Python 3.10 或更高版本。  
@@ -30,17 +22,6 @@
 ```
 pip install cryptography
 ```
-
-或使用 requirements.txt：
-```
-pip install -r requirements.txt
-```
-
-requirements.txt 示例内容：
-```
-cryptography>=39.0
-```
-
 ## 快速开始（运行示例）
 1. 克隆仓库并进入目录：
 ```
@@ -76,6 +57,5 @@ python3 async_tcp_x25519_readable.py --role client --host 服务器IP --port 123
 - 加密负载格式：nonce(12 bytes) || ciphertext || tag(16 bytes)（AES-GCM 的标准输出）。接收方从负载前 12 字节取 nonce，剩余为 ciphertext+tag，用 AES-GCM 解密得到明文。  
 - 关联数据（AAD）：示例中未使用（为 None）。如需防篡改连接元数据，可把 AAD 加入并在双方一致下派生与验证。
 
-#许可
-
+# 许可
 本仓库采用 MIT 许可证
