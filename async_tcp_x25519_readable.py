@@ -1,323 +1,289 @@
 #!/usr/bin/env python3
 """
-Asyncio TCP chat with x25519 handshake and AES-GCM encryption.
-- Descriptive variable names, no nested blocks where avoidable, line-end comments.
-- Usage:
-    # server
-    python3 async_tcp_x25519_readable.py --role server --bind 0.0.0.0 --port 12345
+Secure asynchronous end-to-end chat/file transfer over TCP using X25519 key agreement
+and per-session AES-GCM encryption for privacy and authenticity. Communication is done
+in threads for send/receive independence. File transfers are chunked and verified.
+USAGE:
+  Server:   python3 chatfile.py --server PORT
+  Client:   python3 chatfile.py --connect HOST:PORT
+COMMANDS:
+  /quit           Disconnects.
+  /sendfile PATH  Send file at PATH to the peer (file is chunked, hashed, reassembled and verified on receiver).
+MESSAGE LAYOUT:
+  All application-level messages (after handshake and symmetric key established) use:
+    [4-byte big-endian length][encrypted payload]
+  Encrypted payload is:
+    [12-byte random nonce][AES-GCM ciphertext]
+  There are two types of messages, distinguished by unencrypted magic header once decrypted:
+  1. Text message:
+      [b'TEXT'][UTF-8 data]
+  2. File chunk message:
+      [b'FILE'] 
+      [2-byte little-endian header length]
+      [1-byte filename length][filename utf8]
+      [8-byte file_size][4-byte this_chunk_size][4-byte chunk_index][4-byte total_chunks]
+      [32-byte sha256 of chunk_data]
+      [chunk_data (this_chunk_size bytes)]
+    - Each chunk contains the above header plus actual data.
+    - When all chunks are received and validated by hash, the receiver writes the file atomically.
+    - Received files are renamed as needed to avoid overwrite.
+SECURITY:
+- All communication is encrypted and authenticated.
+- X25519 key exchange is used for forward secrecy.
+- Each session uses a random symmetric key derived using HKDF-SHA256.
+- Each AES-GCM message uses a fresh random nonce.
+DEPENDENCIES:
+  pip install cryptography
+"""
 
-    # client
-    python3 async_tcp_x25519_readable.py --role client --host 127.0.0.1 --port 12345
+import socket
+import struct
+import argparse
+import sys
+import threading
+import queue
+import os
+import hashlib
+from cryptography.hazmat.primitives.asymmetric import x25519      # X25519 key exchange
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF          # HKDF for AES key derivation
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM    # AES-GCM symmetric encryption
 
-Requires:
-    pip install cryptography
-"""  # file docstring
+MAGIC_FILE_CHUNK = b'FILE'            # Magic for file chunk message
+MAGIC_TEXT_LINE = b'TEXT'             # Magic for text line message
 
-import argparse  # argument parsing
-import asyncio  # asyncio primitives
-import struct  # binary packing/unpacking
-import os  # random bytes for nonce
-import sys  # stdin access
+FILE_CHUNK_SIZE = 65536               # File chunk size (64 KiB)
+MAX_FILENAME_LENGTH = 255             # Max file name (UTF-8 bytes)
 
-from cryptography.hazmat.primitives.asymmetric import x25519  # X25519 keys
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF  # HKDF for key derivation
-from cryptography.hazmat.primitives import hashes  # hash algorithms
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # AES-GCM AEAD
+send_queue = queue.Queue()            # Queue for outgoing plaintext messages
+recv_queue = queue.Queue()            # Queue for incoming decrypted messages
+session_aes_key = None                # Symmetric AES session key
+tcp_socket = None                     # TCP socket object
 
-# ---------------------
-# Framing helpers
-# ---------------------
-async def read_exact_bytes(stream_reader: asyncio.StreamReader, total_bytes: int) -> bytes:
-    """
-    Read exactly total_bytes from stream_reader or raise ConnectionError if closed.
-    """  # docstring
-    buffer = b""  # accumulator for received bytes
-    while len(buffer) < total_bytes:  # loop until we have requested amount
-        chunk = await stream_reader.read(total_bytes - len(buffer))  # read remaining bytes
-        if not chunk:
-            raise ConnectionError("stream closed while reading exact bytes")  # unexpected EOF
-        buffer += chunk  # append chunk
-    return buffer  # return collected bytes
+def perform_handshake(transport_socket, is_server_side):
+    """Performs X25519 key exchange and returns the session AES key."""
+    local_private_key = x25519.X25519PrivateKey.generate()
+    local_public_bytes = local_private_key.public_key().public_bytes()
+    if is_server_side:                                    # Server: recv, then send
+        peer_public_bytes = receive_frame(transport_socket)
+        send_frame(transport_socket, local_public_bytes)
+    else:                                                 # Client: send, then recv
+        send_frame(transport_socket, local_public_bytes)
+        peer_public_bytes = receive_frame(transport_socket)
+    peer_public_key = x25519.X25519PublicKey.from_public_bytes(peer_public_bytes)
+    shared_secret = local_private_key.exchange(peer_public_key)
+    session_key = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=b'x25519-aesgcm-session'
+    ).derive(shared_secret)
+    return session_key
 
-async def receive_framed_message(stream_reader: asyncio.StreamReader) -> bytes:
-    """
-    Read a 4-byte big-endian length prefix then that many bytes payload.
-    """
-    header_bytes = await read_exact_bytes(stream_reader, 4)  # read length prefix
-    (payload_length,) = struct.unpack(">I", header_bytes)  # unpack as unsigned int BE
-    payload_bytes = await read_exact_bytes(stream_reader, payload_length)  # read payload
-    return payload_bytes  # return framed payload
+def send_frame(transport_socket, data_bytes):
+    """Send a length-prefixed data frame: [uint32 length][data]. Blocking."""
+    frame_length = struct.pack('>I', len(data_bytes))         # 4-byte big endian length
+    transport_socket.sendall(frame_length + data_bytes)
 
-async def send_framed_message(stream_writer: asyncio.StreamWriter, payload_bytes: bytes) -> None:
-    """
-    Send a 4-byte big-endian length prefix followed by payload_bytes, then drain.
-    """
-    length_prefix = struct.pack(">I", len(payload_bytes))  # pack length
-    stream_writer.write(length_prefix + payload_bytes)  # write prefix + payload
-    await stream_writer.drain()  # ensure data sent
+def receive_frame(transport_socket):
+    """Receive a length-prefixed data frame. Blocking."""
+    length_bytes = b''
+    while len(length_bytes) < 4:
+        chunk = transport_socket.recv(4 - len(length_bytes))
+        if not chunk: raise ConnectionError("Connection closed before length field.")
+        length_bytes += chunk
+    total_length = struct.unpack('>I', length_bytes)[0]
+    data_bytes = b''
+    while len(data_bytes) < total_length:
+        chunk = transport_socket.recv(total_length - len(data_bytes))
+        if not chunk: raise ConnectionError("Connection closed before all data received.")
+        data_bytes += chunk
+    return data_bytes
 
-# ---------------------
-# Handshake helpers
-# ---------------------
-async def perform_handshake_initiator(stream_reader: asyncio.StreamReader,
-                                      stream_writer: asyncio.StreamWriter) -> bytes:
-    """
-    Initiator: send public key first, then receive peer public key, return shared secret.
-    """
-    private_key = x25519.X25519PrivateKey.generate()  # generate private key
-    public_key_bytes = private_key.public_key().public_bytes()  # get public key bytes
-    await send_framed_message(stream_writer, public_key_bytes)  # send our public key
-    peer_public_key_bytes = await receive_framed_message(stream_reader)  # receive peer pubkey
-    peer_public_key = x25519.X25519PublicKey.from_public_bytes(peer_public_key_bytes)  # parse
-    shared_secret = private_key.exchange(peer_public_key)  # compute shared secret
-    return shared_secret  # return raw shared secret
+def encrypt_message(plaintext_bytes):
+    """Encrypt plaintext using the session AES key, with a fresh nonce."""
+    nonce_bytes = os.urandom(12)
+    cipher_bytes = AESGCM(session_aes_key).encrypt(nonce_bytes, plaintext_bytes, None)
+    return nonce_bytes + cipher_bytes
 
-async def perform_handshake_responder(stream_reader: asyncio.StreamReader,
-                                      stream_writer: asyncio.StreamWriter) -> bytes:
-    """
-    Responder: receive peer public key first, then send our public key, return shared secret.
-    """
-    peer_public_key_bytes = await receive_framed_message(stream_reader)  # get peer pubkey
-    private_key = x25519.X25519PrivateKey.generate()  # generate private key
-    public_key_bytes = private_key.public_key().public_bytes()  # get public key bytes
-    await send_framed_message(stream_writer, public_key_bytes)  # send our public key
-    peer_public_key = x25519.X25519PublicKey.from_public_bytes(peer_public_key_bytes)  # parse
-    shared_secret = private_key.exchange(peer_public_key)  # compute shared secret
-    return shared_secret  # return raw shared secret
+def decrypt_message(ciphertext_bytes):
+    """Decrypt a message with the session AES key."""
+    if len(ciphertext_bytes) < 12:
+        raise ValueError("Encrypted message too short (no nonce present).")
+    nonce_bytes, cipher_part = ciphertext_bytes[:12], ciphertext_bytes[12:]
+    decrypted = AESGCM(session_aes_key).decrypt(nonce_bytes, cipher_part, None)
+    return decrypted
 
-def derive_aes_key_from_shared_secret(shared_secret: bytes) -> bytes:
-    """
-    Derive a 32-byte AES key from shared_secret using HKDF-SHA256.
-    """
-    hkdf_instance = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"x25519-aesgcm-v1")  # HKDF setup
-    derived_key = hkdf_instance.derive(shared_secret)  # derive 32 bytes
-    return derived_key  # return AES-256 key
-
-# ---------------------
-# Encryption helpers
-# ---------------------
-def encrypt_with_aes_gcm(aes_key: bytes, plaintext_bytes: bytes) -> bytes:
-    """
-    Encrypt plaintext_bytes with AES-GCM using a random 12-byte nonce.
-    Returns nonce || ciphertext_with_tag.
-    """
-    aead_cipher = AESGCM(aes_key)  # AESGCM object
-    nonce_bytes = os.urandom(12)  # 96-bit nonce for GCM
-    ciphertext_with_tag = aead_cipher.encrypt(nonce_bytes, plaintext_bytes, associated_data=None)  # encrypt
-    return nonce_bytes + ciphertext_with_tag  # prepend nonce
-
-def decrypt_with_aes_gcm(aes_key: bytes, payload_bytes: bytes) -> bytes:
-    """
-    Decrypt payload_bytes (nonce || ciphertext||tag) with AES-GCM, return plaintext.
-    """
-    if len(payload_bytes) < 12 + 16:
-        raise ValueError("payload too short for AES-GCM")  # basic length check
-    nonce_bytes = payload_bytes[:12]  # extract nonce
-    ciphertext_with_tag = payload_bytes[12:]  # remaining is ciphertext+tag
-    aead_cipher = AESGCM(aes_key)  # AESGCM object
-    plaintext_bytes = aead_cipher.decrypt(nonce_bytes, ciphertext_with_tag, associated_data=None)  # decrypt
-    return plaintext_bytes  # return plaintext
-
-# ---------------------
-# Stdin reader (non-blocking for asyncio)
-# ---------------------
-async def stdin_line_reader_to_queue(output_queue: asyncio.Queue) -> None:
-    """
-    Read lines from stdin using a thread executor and push to output_queue.
-    Puts None into queue when EOF reached.
-    """
-    event_loop = asyncio.get_running_loop()  # current event loop
-
-    def blocking_readline() -> bytes:
-        return sys.stdin.buffer.readline()  # blocking call to read stdin
-
+def sending_thread_loop():
+    """Thread: takes plaintext messages from send_queue, encrypts and sends to peer."""
     while True:
-        line_bytes = await event_loop.run_in_executor(None, blocking_readline)  # run blocking IO in executor
-        if not line_bytes:
-            await output_queue.put(None)  # signal EOF
-            return
-        stripped_line = line_bytes.rstrip(b"\n")  # remove trailing newline
-        await output_queue.put(stripped_line)  # push to queue
-        if stripped_line == b"/quit":  # allow /quit to stop
-            return
+        plaintext = send_queue.get()
+        if plaintext is None:
+            break
+        encrypted = encrypt_message(plaintext)
+        send_frame(tcp_socket, encrypted)
 
-# ---------------------
-# Send and receive loops
-# ---------------------
-async def send_loop_from_queue(stream_writer: asyncio.StreamWriter,
-                               aes_key: bytes,
-                               send_queue: asyncio.Queue) -> None:
-    """
-    Consume bytes from send_queue, encrypt and send framed messages over stream_writer.
-    Exits when queue yields None or '/quit'.
-    """
-    try:
-        while True:
-            item = await send_queue.get()  # get next item
-            if item is None:
-                break  # EOF signal
-            if item == b"/quit":
-                break  # user requested quit
-            encrypted_payload = encrypt_with_aes_gcm(aes_key, item)  # encrypt plaintext
-            await send_framed_message(stream_writer, encrypted_payload)  # send framed encrypted payload
-    finally:
-        try:
-            stream_writer.write_eof()  # signal EOF to peer if supported
-        except Exception:
-            pass
-        try:
-            await stream_writer.drain()  # flush pending writes
-        except Exception:
-            pass
-
-async def receive_loop_to_stdout(stream_reader: asyncio.StreamReader, aes_key: bytes) -> None:
-    """
-    Receive framed encrypted messages, decrypt and print to stdout.
-    """
+def receiving_thread_loop():
+    """Thread: receives encrypted frames, decrypts and queues for processing."""
     while True:
         try:
-            framed_payload = await receive_framed_message(stream_reader)  # get framed encrypted payload
-        except ConnectionError:
-            return  # stream closed
-        if not framed_payload:
-            return  # no data => exit
+            encrypted_frame = receive_frame(tcp_socket)
+        except Exception:
+            break
         try:
-            plaintext_bytes = decrypt_with_aes_gcm(aes_key, framed_payload)  # decrypt
+            decrypted_message = decrypt_message(encrypted_frame)
+        except Exception:
+            print("[Decryption failed. Disconnecting.]")
+            break
+        recv_queue.put(decrypted_message)
+    recv_queue.put(None)                              # Passing signal for processor to quit
+
+def user_input_loop():
+    """Reads user input lines/commands and pushes into send_queue (handles /sendfile)."""
+    while True:
+        try:
+            user_line = input("> ")
+        except EOFError:
+            send_queue.put(None)
+            break
+        trimmed = user_line.strip()
+        if trimmed == "/quit":
+            send_queue.put(None)
+            break
+        if trimmed.startswith("/sendfile "):
+            _, path = trimmed.split(" ", 1)
+            if os.path.isfile(path):
+                send_file_by_chunks(path)
+            else:
+                print("[File not found]")
+            continue
+        # Send as text message (prepend magic)
+        message_bytes = MAGIC_TEXT_LINE + trimmed.encode()
+        send_queue.put(message_bytes)
+
+def send_file_by_chunks(filepath):
+    """Reads file, splits into chunks, sends each with detailed encoded file headers."""
+    file_size = os.path.getsize(filepath)
+    base_filename = os.path.basename(filepath)
+    file_name_bytes = base_filename.encode("utf-8")
+    if len(file_name_bytes) > MAX_FILENAME_LENGTH:
+        print("[File name too long]")
+        return
+    total_chunks = (file_size + FILE_CHUNK_SIZE - 1) // FILE_CHUNK_SIZE
+    with open(filepath, "rb") as file_handle:
+        for chunk_index in range(total_chunks):
+            chunk_data = file_handle.read(FILE_CHUNK_SIZE)
+            chunk_hash = hashlib.sha256(chunk_data).digest()
+            header_buffer = MAGIC_FILE_CHUNK
+            # Compose header (see docstring)
+            header_len = 2 + 1 + len(file_name_bytes) + 8 + 4 + 4 + 4 + 32
+            header_buffer += struct.pack('<H', header_len)                    # header length (LE) (2)
+            header_buffer += struct.pack('<B', len(file_name_bytes))          # filename length (1)
+            header_buffer += file_name_bytes                                  # filename (N)
+            header_buffer += struct.pack('<Q', file_size)                     # file size (8)
+            header_buffer += struct.pack('<I', len(chunk_data))               # this chunk data len (4)
+            header_buffer += struct.pack('<I', chunk_index)                   # chunk number (4)
+            header_buffer += struct.pack('<I', total_chunks)                  # total chunks (4)
+            header_buffer += chunk_hash                                       # chunk sha256 (32)
+            packet_bytes = header_buffer + chunk_data                         # Full message
+            send_queue.put(packet_bytes)
+    print(f"[File sent: {filepath} ({file_size} bytes, {total_chunks} chunks)]")
+
+def save_file_chunks_to_disk(chunks_dict, file_metadata):
+    """Writes all collected file chunks in-order to a unique file, verifies hash, returns final filename."""
+    file_name, total_chunks, total_length = file_metadata
+    candidate_filename = file_name
+    duplicate_count = 0
+    while os.path.exists(candidate_filename):
+        duplicate_count += 1
+        candidate_filename = f"{file_name}.{duplicate_count}"
+    with open(candidate_filename, "wb") as output_file:
+        for i in range(total_chunks):
+            output_file.write(chunks_dict[i])
+    print(f"[File received: {candidate_filename} ({total_length} bytes)]")
+
+def main_message_processing_loop():
+    """Processes items from recv_queue: prints text, reassembles and writes received files."""
+    files_waiting = dict()    # {meta_tuple: {chunk_index: chunk_data}}, stores file chunks in-memory
+    chunks_received_count = dict()  # {meta_tuple: count}, tracks received chunks for each file
+    while True:
+        incoming = recv_queue.get()  # Get the next decrypted item from the queue (blocking)
+        if incoming is None:  # Check for termination signal
+            break
+        if incoming.startswith(MAGIC_TEXT_LINE):  # Check if it's a text message
+            text_bytes = incoming[4:]  # The text message starts after the 4-byte magic
             try:
-                plaintext_text = plaintext_bytes.decode("utf-8", errors="replace")  # decode for display
+                text_line = text_bytes.decode("utf-8", errors="replace")  # Decode bytes to string
             except Exception:
-                plaintext_text = "<binary data>"  # fallback label
-            # print peer message and reprint prompt
-            print("\nPeer:", plaintext_text)  # show peer message
-            print("> ", end="", flush=True)  # prompt
-        except Exception as decrypt_error:
-            print("Decrypt error:", decrypt_error)  # show decrypt error and continue
-
-# ---------------------
-# Server and client runners
-# ---------------------
-async def handle_single_client_connection(client_reader: asyncio.StreamReader,
-                                          client_writer: asyncio.StreamWriter) -> None:
-    """
-    Handle an accepted client connection: perform handshake, then start send/recv tasks.
-    This function is intentionally flat (no deep nesting) for clarity.
-    """
-    peer_address = client_writer.get_extra_info("peername")  # get peer address
-    print("Accepted connection from", peer_address)  # log connection
-    try:
-        shared_secret = await perform_handshake_responder(client_reader, client_writer)  # responder handshake
-    except Exception as handshake_error:
-        print("Handshake failed:", handshake_error)  # log and return
-        try:
-            client_writer.close()
-            await client_writer.wait_closed()
-        except Exception:
-            pass
-        return
-    aes_key = derive_aes_key_from_shared_secret(shared_secret)  # derive AES key
-    print("Handshake complete. AES key derived.")  # notify ready
-    send_queue = asyncio.Queue()  # queue for lines to send
-    stdin_task = asyncio.create_task(stdin_line_reader_to_queue(send_queue))  # task reading stdin
-    send_task = asyncio.create_task(send_loop_from_queue(client_writer, aes_key, send_queue))  # sending task
-    receive_task = asyncio.create_task(receive_loop_to_stdout(client_reader, aes_key))  # receiving task
-
-    done_tasks, pending_tasks = await asyncio.wait(
-        {stdin_task, send_task},
-        return_when=asyncio.FIRST_COMPLETED
-    )  # wait until stdin or send finishes
-
-    # signal send loop to exit if not already
-    await send_queue.put(None)  # ensure send loop will terminate
-    await send_task  # wait send loop finished
-
-    try:
-        client_writer.close()  # close connection writer
-        await client_writer.wait_closed()
-    except Exception:
-        pass
-
-    await receive_task  # wait receive loop finished
-    return
-
-async def run_server(bind_address: str, bind_port: int) -> None:
-    """
-    Start TCP server and accept a single connection, handling it with handle_single_client_connection.
-    """
-    server = await asyncio.start_server(handle_single_client_connection, bind_address, bind_port)  # start server
-    socket_names = []
-    for server_socket in server.sockets:
-        socket_names.append(str(server_socket.getsockname()))  # collect listening addresses
-    listening_addresses = ", ".join(socket_names)  # join for display
-    print("Listening on", listening_addresses)  # show listening addrs
-    async with server:
-        await server.serve_forever()  # serve forever
-
-async def run_client(remote_host: str, remote_port: int) -> None:
-    """
-    Connect to remote_host:remote_port, perform initiator handshake, then start send/recv tasks.
-    """
-    reader, writer = await asyncio.open_connection(remote_host, remote_port)  # open connection
-    print("Connected to", (remote_host, remote_port))  # log
-    try:
-        shared_secret = await perform_handshake_initiator(reader, writer)  # initiator handshake
-    except Exception as handshake_error:
-        print("Handshake failed:", handshake_error)  # log
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
-            pass
-        return
-    aes_key = derive_aes_key_from_shared_secret(shared_secret)  # derive AES key
-    print("Handshake complete. AES key derived.")  # notify ready
-    send_queue = asyncio.Queue()  # create queue for stdin lines
-    stdin_task = asyncio.create_task(stdin_line_reader_to_queue(send_queue))  # task reading stdin
-    send_task = asyncio.create_task(send_loop_from_queue(writer, aes_key, send_queue))  # sending task
-    receive_task = asyncio.create_task(receive_loop_to_stdout(reader, aes_key))  # receiving task
-
-    done_tasks, pending_tasks = await asyncio.wait(
-        {stdin_task, send_task},
-        return_when=asyncio.FIRST_COMPLETED
-    )  # wait until stdin or send finishes
-
-    await send_queue.put(None)  # ensure send loop stops
-    await send_task  # wait for send completion
-
-    try:
-        writer.close()  # close writer
-        await writer.wait_closed()
-    except Exception:
-        pass
-
-    await receive_task  # wait for receive loop to finish
-    return
-
-# ---------------------
-# Argument parsing and entrypoint
-# ---------------------
-def parse_command_line_arguments():
-    """
-    Parse and return command-line arguments.
-    """
-    parser = argparse.ArgumentParser(description="Asyncio TCP chat with x25519 + AES-GCM, readable variable names")  # set up parser
-    parser.add_argument("--role", choices=("server", "client"), required=True)  # role flag
-    parser.add_argument("--bind", default="0.0.0.0")  # bind address for server
-    parser.add_argument("--host", default="127.0.0.1")  # host for client
-    parser.add_argument("--port", type=int, default=12345)  # port for both
-    return parser.parse_args()  # return parsed args
+                text_line = "<decode error>"  # On decode failure, use placeholder
+            print("\nPeer:", text_line)  # Display incoming message
+        elif incoming.startswith(MAGIC_FILE_CHUNK):  # File chunk detected by magic
+            cursor = 4  # Starting index past the 'FILE' magic
+            header_length = struct.unpack('<H', incoming[cursor:cursor+2])[0]; cursor += 2  # Fetch header length
+            filename_length = incoming[cursor]; cursor += 1  # Fetch filename length (one byte)
+            filename = incoming[cursor:cursor+filename_length].decode("utf-8", errors="replace"); cursor += filename_length  # Get filename
+            file_size = struct.unpack('<Q', incoming[cursor:cursor+8])[0]; cursor += 8  # Get declared total file size
+            this_chunk_length = struct.unpack('<I', incoming[cursor:cursor+4])[0]; cursor += 4  # This data chunk size
+            chunk_index = struct.unpack('<I', incoming[cursor:cursor+4])[0]; cursor += 4  # Which chunk number is this
+            chunks_total = struct.unpack('<I', incoming[cursor:cursor+4])[0]; cursor += 4  # Total number of chunks
+            hash_value = incoming[cursor:cursor+32]; cursor += 32  # SHA256 hash of this chunk, for validation
+            chunk_data = incoming[cursor:cursor+this_chunk_length]  # Actual chunk data slice
+            file_key = (filename, chunks_total, file_size)  # Tuple uniquely identifying this file transfer
+            if file_key not in files_waiting:  # If this is the first chunk for this file
+                files_waiting[file_key] = {}  # Initialize the chunk dict for reassembly
+                chunks_received_count[file_key] = 0  # Initialize the counter for this file
+                print(f"[Started receiving file: {filename}]")  # Logging file header
+            computed_hash = hashlib.sha256(chunk_data).digest()  # Hash chunk for validation
+            if computed_hash != hash_value:  # Check for data corruption
+                print(f"[Warning: File chunk {chunk_index} hash check failed. Skipping chunk.]")  # Warn about hash mismatch
+            else:
+                if chunk_index not in files_waiting[file_key]:  # Only count unique chunks
+                    files_waiting[file_key][chunk_index] = chunk_data  # Save received chunk by its index
+                    chunks_received_count[file_key] += 1  # Increment counter for completed chunks
+            print(f"[File {filename} chunk {chunk_index+1}/{chunks_total} received]")  # Display progress
+            if chunks_received_count[file_key] == chunks_total:  # If all expected chunks are received
+                save_file_chunks_to_disk(files_waiting[file_key], file_key)  # Assemble and write the file
+                del files_waiting[file_key]  # Cleanup memory for this file
+                del chunks_received_count[file_key]
+        else:
+            print("[Warning: Unknown message type received]")  # Unrecognized message type
 
 def main():
-    """
-    Entry point: parse args and run server or client accordingly.
-    """
-    args = parse_command_line_arguments()  # get args
-    try:
-        if args.role == "server":  # server role
-            asyncio.run(run_server(args.bind, args.port))  # run server
-        else:  # client role
-            asyncio.run(run_client(args.host, args.port))  # run client
-    except KeyboardInterrupt:
-        print("Interrupted. Exiting.")  # Ctrl+C handled
+    parser = argparse.ArgumentParser(description="Secure async chat/file transfer, X25519 handshake + AES-GCM + threads.")  # Setup argument parser
+    group = parser.add_mutually_exclusive_group(required=True)  # Only allow server or client at once
+    group.add_argument("--server", metavar="PORT", help="Run as server listening at this port")  # Server mode flag
+    group.add_argument("--connect", metavar="HOST:PORT", help="Connect to server as client (eg: 10.1.2.3:8000)")  # Client mode flag
+    args = parser.parse_args()  # Parse command line arguments
+    global session_aes_key, tcp_socket  # Use global session key and socket
+    if args.server:  # If server mode
+        server_socket = socket.socket()  # Create new TCP socket
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Enable address reuse
+        server_socket.bind(('0.0.0.0', int(args.server)))  # Listen on all interfaces on specified port
+        server_socket.listen(1)  # Start listening (max 1 queued connection)
+        print(f"[Listening on 0.0.0.0:{args.server}]")  # Inform
+        accepted_socket, peer_address = server_socket.accept()  # Accept a connection
+        print(f"[Accepted connection from {peer_address}]")  # Inform
+        tcp_socket = accepted_socket  # Set global socket
+        session_aes_key = perform_handshake(accepted_socket, True)  # Perform server-side handshake
+    else:  # Client mode
+        remote_host, remote_port = args.connect.split(":")  # Extract host and port
+        client_socket = socket.create_connection((remote_host, int(remote_port)))  # Establish TCP connection
+        print(f"[Connected to {remote_host}:{remote_port}]")  # Inform
+        tcp_socket = client_socket  # Set global socket
+        session_aes_key = perform_handshake(client_socket, False)  # Perform client-side handshake
+    print("[Handshake complete. Secure session established.]")  # Confirm secure session ready
+    sender_thread = threading.Thread(target=sending_thread_loop, daemon=True)  # Thread for sending plaintext from send_queue
+    receiver_thread = threading.Thread(target=receiving_thread_loop, daemon=True)  # Thread for receiving/decrypting into recv_queue
+    sender_thread.start()  # Start sender thread
+    receiver_thread.start()  # Start receiver thread
+    message_processor_thread = threading.Thread(target=main_message_processing_loop)  # Thread for message/file processing
+    message_processor_thread.start()  # Start processor thread
+    user_input_loop()  # Handle user input and command loop (blocking in main thread)
+    sender_thread.join()  # Wait for sender exit
+    receiver_thread.join()  # Wait for receiver exit
+    recv_queue.put(None)  # Signal processor thread to terminate
+    message_processor_thread.join()  # Wait for processor thread exit
+    print("[Session closed]")  # Inform user
 
 if __name__ == "__main__":
-    main()  # call main
+    main()
